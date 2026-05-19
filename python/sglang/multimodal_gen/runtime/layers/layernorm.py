@@ -11,13 +11,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.qknorm_across_heads_rope import (
+    can_use_fused_inplace_qknorm_across_heads_rope,
+    fused_inplace_qknorm_across_heads_rope,
+)
 from sglang.jit_kernel.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.jit_kernel.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+    fused_inplace_qknorm_across_heads,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -907,6 +915,202 @@ def apply_qk_norm_rope(
         is_neox=is_neox,
         positions=positions,
     )
+
+
+def apply_qk_norm_across_heads_with_optional_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    *,
+    positions: Optional[torch.Tensor] = None,
+    position_offset: int = 0,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply across-heads RMSNorm and optionally RoPE in a single fused kernel.
+
+    Mirrors :func:`apply_qk_norm_with_optional_rope` but for the across-heads
+    QK-Norm variant — ``q_norm.weight`` / ``k_norm.weight`` have shape
+    ``[num_heads * head_dim]`` and a single RMSNorm reduction is taken over
+    the full hidden dimension per token (as opposed to per-head reductions
+    in :func:`apply_qk_norm_rope`).
+
+    Used by DiT models that set ``qk_norm = "rms_norm_across_heads"``
+    (Wan, Sana, Helios).
+
+    Args:
+        q, k: ``[num_tokens, hidden_size]`` or any shape that flattens
+            cleanly to that — the kernel only inspects the last dim.
+        q_norm, k_norm: per-stream RMSNorm modules with weight of shape
+            ``[hidden_size]``.
+        head_dim: per-head dimension; RoPE is applied to the first
+            ``rope_dim`` elements of every head.
+        cos_sin_cache: ``[max_pos, rope_dim]`` float32. If ``None``, the
+            helper falls back to the existing across-heads QK-Norm only path
+            (kernel ``fused_inplace_qknorm_across_heads``).
+        positions: optional ``[num_tokens]`` int32/int64 tensor; defaults to
+            ``arange(position_offset, position_offset + num_tokens)``.
+        allow_inplace: when False, fall back to the non-mutating eager path.
+
+    On CUDA with fp16/bf16 contiguous inputs and a supported (head_dim,
+    rope_dim) pair this dispatches to the in-place fused kernel
+    ``fused_inplace_qknorm_across_heads_rope``; otherwise it goes through an
+    eager fallback identical to the pre-fusion code (RMSNorm + flashinfer
+    RoPE).
+    """
+    if cos_sin_cache is None:
+        # No RoPE: degrade to the across-heads fused-norm kernel when
+        # possible, else the eager RMSNorm forward.
+        return _apply_qk_norm_across_heads(
+            q=q,
+            k=k,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            allow_inplace=allow_inplace,
+        )
+
+    return _apply_qk_norm_across_heads_rope(
+        q=q,
+        k=k,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        position_offset=position_offset,
+        allow_inplace=allow_inplace,
+    )
+
+
+def _apply_qk_norm_across_heads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    allow_inplace: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Across-heads QK-Norm, no RoPE; fused inplace kernel when supported."""
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    if (
+        _is_cuda
+        and allow_inplace
+        and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
+    ):
+        q_shape = q.shape
+        k_shape = k.shape
+        fused_inplace_qknorm_across_heads(
+            q.view(-1, q_shape[-1]),
+            k.view(-1, k_shape[-1]),
+            q_norm.weight,
+            k_norm.weight,
+            q_eps,
+        )
+        return q, k
+    return q_norm(q), k_norm(k)
+
+
+def _apply_qk_norm_across_heads_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    position_offset: int,
+    allow_inplace: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Across-heads QK-Norm + interleave (GPT-J) RoPE, fused when possible."""
+    from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+        apply_flashinfer_rope_qk_inplace,
+    )
+
+    if q.shape != k.shape:
+        raise ValueError(
+            "apply_qk_norm_across_heads_rope expects q/k to have the same shape, "
+            f"got {q.shape} vs {k.shape}"
+        )
+    if q.size(-1) % head_dim != 0:
+        raise ValueError(
+            f"hidden_size {q.size(-1)} is not a multiple of head_dim {head_dim}"
+        )
+
+    num_tokens = q.numel() // q.size(-1)
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    rope_dim = cos_sin_cache.size(-1)
+    fused_enabled = os.getenv(
+        "SGLANG_ENABLE_FUSED_QKNORM_ACROSS_HEADS_ROPE", "1"
+    ).lower() not in {"0", "false", "off", "no"}
+
+    if positions is None:
+        positions = torch.arange(
+            position_offset,
+            position_offset + num_tokens,
+            device=q.device,
+            dtype=torch.int64,
+        )
+    else:
+        if positions.dim() != 1 or positions.numel() != num_tokens:
+            raise ValueError(
+                "positions must be 1D of length num_tokens, "
+                f"got shape={tuple(positions.shape)}, num_tokens={num_tokens}"
+            )
+
+    if (
+        fused_enabled
+        and _is_cuda
+        and allow_inplace
+        and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and can_use_fused_inplace_qknorm_across_heads_rope(head_dim, rope_dim, q.dtype)
+    ):
+        fused_inplace_qknorm_across_heads_rope(
+            q=q.view(num_tokens, -1),
+            k=k.view(num_tokens, -1),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            eps=q_eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+        return q, k
+
+    # Eager fallback: across-heads RMSNorm followed by per-head interleave
+    # RoPE. RMSNorm preserves input dtype (the native path upcasts to fp32
+    # internally then casts back). FlashInfer's RoPE wrapper accepts 4D
+    # [batch, seq, num_heads, head_dim]; flatten any leading dims into a
+    # single batch axis of 1 so positions/cos_sin_cache are interpreted
+    # consistently with the fused path.
+    q_out = q_norm(q)
+    k_out = k_norm(k)
+    out_shape = q_out.shape
+    num_heads = out_shape[-1] // head_dim
+    q4d = q_out.reshape(1, num_tokens, num_heads, head_dim)
+    k4d = k_out.reshape(1, num_tokens, num_heads, head_dim)
+    q4d, k4d = apply_flashinfer_rope_qk_inplace(
+        q=q4d,
+        k=k4d,
+        cos_sin_cache=cos_sin_cache,
+        head_size=head_dim,
+        is_neox=False,
+        positions=positions,
+    )
+    return q4d.reshape(out_shape), k4d.reshape(out_shape)
 
 
 def apply_rmsnorm_tanh_mul_add(
