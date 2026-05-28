@@ -10,6 +10,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.jit_kernel.diffusion.pixel_norm import apply_pixel_norm
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
@@ -39,13 +40,21 @@ class PerChannelRMSNorm(nn.Module):
     ) -> torch.Tensor:
         """
         Apply RMS normalization along the configured dimension.
+
+        The eager-equivalent operation is::
+
+            mean_sq = (x ** 2).mean(dim=channel_dim, keepdim=True)
+            y = x / torch.sqrt(mean_sq + eps)
+
+        ``apply_pixel_norm`` fuses the (pow, mean, rsqrt, multiply) chain into a
+        single Triton kernel with fp32 accumulation on CUDA inference inputs and
+        otherwise falls back to a numerically matching PyTorch implementation.
+        Note: the original implementation accepted an unused ``channel_dim``
+        override and always used ``self.channel_dim``; we preserve that to
+        avoid changing observable behavior.
         """
-        channel_dim = channel_dim or self.channel_dim
-        # Compute mean of squared values along `dim`, keep dimensions for broadcasting.
-        mean_sq = torch.mean(x**2, dim=self.channel_dim, keepdim=True)
-        # Normalize by the root-mean-square (RMS).
-        rms = torch.sqrt(mean_sq + self.eps)
-        return x / rms
+        del channel_dim  # Intentional: original code did not honor this arg.
+        return apply_pixel_norm(x, channel_dim=self.channel_dim, eps=self.eps)
 
 
 # Like LTXCausalConv3d, but whether causal inference is performed can be specified at runtime

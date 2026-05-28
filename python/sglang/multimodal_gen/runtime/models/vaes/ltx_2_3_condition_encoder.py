@@ -3,6 +3,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.diffusion.pixel_norm import apply_pixel_norm
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -31,15 +32,21 @@ def _patchify_video(sample: torch.Tensor, patch_size: int) -> torch.Tensor:
 
 
 class LTX23VideoPixelNorm(nn.Module):
+    """Per-pixel (per-location) RMS normalization.
+
+    Eager equivalent::
+
+        mean_sq = (x ** 2).mean(dim=self.dim, keepdim=True)
+        y = x / torch.sqrt(mean_sq + self.eps)
+    """
+
     def __init__(self, dim: int = 1, eps: float = 1e-8) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean_sq = torch.mean(x**2, dim=self.dim, keepdim=True)
-        rms = torch.sqrt(mean_sq + self.eps)
-        return x / rms
+        return apply_pixel_norm(x, channel_dim=self.dim, eps=self.eps)
 
 
 class LTX23PerChannelStatistics(nn.Module):

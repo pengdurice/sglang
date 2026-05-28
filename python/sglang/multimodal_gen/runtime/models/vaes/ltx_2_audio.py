@@ -9,6 +9,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
+from sglang.jit_kernel.diffusion.pixel_norm import apply_pixel_norm
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
@@ -71,6 +72,11 @@ class LTX2AudioCausalConv2d(nn.Module):
 class LTX2AudioPixelNorm(nn.Module):
     """
     Per-pixel (per-location) RMS normalization layer.
+
+    Eager equivalent::
+
+        mean_sq = (x ** 2).mean(dim=self.dim, keepdim=True)
+        y = x / torch.sqrt(mean_sq + self.eps)
     """
 
     def __init__(self, dim: int = 1, eps: float = 1e-8) -> None:
@@ -79,9 +85,7 @@ class LTX2AudioPixelNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean_sq = torch.mean(x**2, dim=self.dim, keepdim=True)
-        rms = torch.sqrt(mean_sq + self.eps)
-        return x / rms
+        return apply_pixel_norm(x, channel_dim=self.dim, eps=self.eps)
 
 
 class LTX2AudioAttnBlock(nn.Module):
